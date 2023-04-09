@@ -146,7 +146,8 @@ class Group(object):
 
     def __init__(self):
         self._group = list()
-        self._DG = None
+
+        self._DG = None # for group.prune(idxs=NEW_IDXS)
 
     def prune(self, idxs=None):
         """Prune all coupled layers in the group
@@ -158,7 +159,21 @@ class Group(object):
             new_group.prune()
         else:
             for dep, idxs in self._group:
-                dep(idxs)
+                if dep.target.type == ops.OPTYPE.PARAMETER:
+                    old_parameter = dep.target.module
+                    name = self._DG._param_to_name[old_parameter]
+                    self._DG._param_to_name.pop(old_parameter)
+                    pruned_parameter = dep(idxs)
+                    path = name.split('.')
+                    module = self._DG.model
+                    for p in path[:-1]:
+                        module = getattr(module, p)
+                    setattr(module, path[-1], pruned_parameter)
+                    self._DG._param_to_name[pruned_parameter] = name
+                    self._DG.module2node[pruned_parameter] = self._DG.module2node.pop(old_parameter)
+                    self._DG.module2node[pruned_parameter].module = pruned_parameter           
+                else:
+                    dep(idxs)
 
     def add_dep(self, dep, idxs):
         self._group.append(GroupItem(dep=dep, idxs=idxs))
@@ -297,7 +312,7 @@ class DependencyGraph(object):
             if ( op_type in prunable_module_types and op_type!=ops.OPTYPE.ELEMENTWISE ) or m.__class__ in self.CUSTOMIZED_PRUNERS.keys():
                 wrapped_parameters.extend(list(m.parameters()))
         unwrapped_detected = []
-        param_to_name = {}
+        _param_to_name = {}
         for name, p in self.model.named_parameters():
             is_wrapped = False
             for p_wrapped in wrapped_parameters:
@@ -306,17 +321,22 @@ class DependencyGraph(object):
                     break
             if not is_wrapped:
                 unwrapped_detected.append(p)
-                param_to_name[p] = name
+                _param_to_name[p] = name
         if unwrapped_parameters is None:
             unwrapped_parameters = []
-
+        self._param_to_name = _param_to_name
         unwrapped_detected = list( set(unwrapped_detected) - set([p for (p, _) in unwrapped_parameters]) )
         if len(unwrapped_detected)>0 and self.verbose:
-            warnings.warn("Unwrapped parameters detected: {}.\n Torch-Pruning will prune the last dimension of a parameter. If you wish to customize this behavior, please provide an unwrapped_parameters argument.".format([param_to_name[p] for p in unwrapped_detected]))
+            warnings.warn("Unwrapped parameters detected: {}.\n Torch-Pruning will prune the last non-singleton dimension of a parameter. If you wish to customize this behavior, please provide an unwrapped_parameters argument.".format([_param_to_name[p] for p in unwrapped_detected]))
         for p in unwrapped_detected:
-            unwrapped_parameters.append( UnwrappedParameters(parameters=p, pruning_dim=-1) ) # prune the last dim by daufault
+            # get the last dimension that >1
+            def last_non_singleton_dim(tensor):
+                non_singleton_dims = [i for i, s in enumerate(tensor.shape) if s > 1]
+                return non_singleton_dims[-1] if non_singleton_dims else None
+            pruning_dim = last_non_singleton_dim(p)
+            if pruning_dim is not None:
+                unwrapped_parameters.append( UnwrappedParameters(parameters=p, pruning_dim=pruning_dim) ) # prune the last non-singleton dim by daufault
         self.unwrapped_parameters = unwrapped_parameters
-
         # Build computational graph by tracing.
         self.module2node = self._trace(
             model, example_inputs, forward_fn, output_transform=output_transform
@@ -357,6 +377,7 @@ class DependencyGraph(object):
                 if prunable_chs is None: continue
                 if prunable_chs <= len(idxs):
                     return False
+
             if self.is_in_channel_pruning_fn(dep.handler):
                 prunable_in_chs = self.get_in_channels(
                     dep.target.module)
@@ -479,9 +500,12 @@ class DependencyGraph(object):
     def get_out_channels(self, module_or_node):
         if isinstance(module_or_node, Node):
             module = module_or_node.module
+            pruning_dim = module_or_node.pruning_dim
         else:
             module = module_or_node
+            pruning_dim = self.module2node[module].pruning_dim
         p = self.get_pruner_of_module(module)
+        p.pruning_dim = pruning_dim
         if p is None:
             return None
         return p.get_out_channels(module)
@@ -489,9 +513,12 @@ class DependencyGraph(object):
     def get_in_channels(self, module_or_node):
         if isinstance(module_or_node, Node):
             module = module_or_node.module
+            pruning_dim = module_or_node.pruning_dim
         else:
             module = module_or_node
+            pruning_dim = self.module2node[module].pruning_dim
         p = self.get_pruner_of_module(module)
+        p.pruning_dim = pruning_dim
         if p is None:
             return None
         return p.get_in_channels(module)
@@ -705,7 +732,7 @@ class DependencyGraph(object):
                                 if f[0].variable is p:
                                     is_unwrapped_param = True
                                     gradfn2module[f[0]] = p
-                                    self._module2name[p] = "UnwrappedParameter_{}".format(j)
+                                    self._module2name[p] = "UnwrappedParameter_{} ({})".format(j, p.shape)
                             if not is_unwrapped_param:
                                 continue
                         input_node = create_node_if_not_exists(f[0])
