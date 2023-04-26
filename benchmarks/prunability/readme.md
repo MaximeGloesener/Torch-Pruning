@@ -166,17 +166,68 @@ Pruning vit_b_32:
 
 ## 2. YOLO v8
 Please refer to Issue [#147](https://github.com/VainF/Torch-Pruning/issues/147#issuecomment-1507475657) for more details.
+
+#### Ultralytics
 ```bash
 git clone https://github.com/ultralytics/ultralytics.git 
 cp yolov8_pruning.py ultralytics/
 cd ultralytics 
+```
 
+#### Modification
+The ``model.train`` function for YOLO training will replace the pruned model with a new one. So we have to make some modifications to the model.train function in ultralytics/yolo/engine/model.py. 
+
+For example, replace the model.train function with:
+```python
+def train(self, **kwargs):
+    """
+    Trains the model on a given dataset.
+
+    Args:
+        **kwargs (Any): Any number of arguments representing the training configuration.
+    """
+    self._check_is_pytorch_model()
+    if self.session:  # Ultralytics HUB session
+        if any(kwargs):
+            LOGGER.warning('WARNING ⚠️ using HUB training arguments, ignoring local training arguments.')
+        kwargs = self.session.train_args
+        self.session.check_disk_space()
+    check_pip_update_available()
+    overrides = self.overrides.copy()
+    overrides.update(kwargs)
+    if kwargs.get('cfg'):
+        LOGGER.info(f"cfg file passed. Overriding default params with {kwargs['cfg']}.")
+        overrides = yaml_load(check_yaml(kwargs['cfg']))
+    overrides['mode'] = 'train'
+    if not overrides.get('data'):
+        raise AttributeError("Dataset required but missing, i.e. pass 'data=coco128.yaml'")
+    if overrides.get('resume'):
+        overrides['resume'] = self.ckpt_path
+    self.task = overrides.get('task') or self.task
+    self.trainer = TASK_MAP[self.task][1](overrides=overrides, _callbacks=self.callbacks)
+    ########################### Modification
+    #if not overrides.get('resume'):  # disable .get_model
+        #self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
+        #self.model = self.trainer.model
+    self.trainer.model = self.model # manually set the pruned model
+    ########################### Modification
+    self.trainer.hub_session = self.session  # attach optional HUB session
+    self.trainer.train()
+    # update model and cfg after training
+    if RANK in (-1, 0):
+        self.model, _ = attempt_load_one_weight(str(self.trainer.best))
+        self.overrides = self.model.args
+        self.metrics = getattr(self.trainer.validator, 'metrics', None)  # TODO: no metrics returned by DDP
+```
+
+#### Training
+```
 # This minimal example will craft a yolov8-half and fine-tune it on the coco128 toy set.
 python yolov8_pruning.py
 ```
 
 #### Screenshot for coco128 post-training:
-<img width="960" alt="image" src="https://user-images.githubusercontent.com/18592211/232287178-95825d66-c569-479d-8b6d-d433ff0d6739.png">
+<img width="876" alt="image" src="https://user-images.githubusercontent.com/18592211/234308234-771e1895-06a3-43a7-8967-b3736ee06d87.png">
 
 
 #### Outputs of yolov8_pruning.py:
